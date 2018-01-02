@@ -764,6 +764,11 @@ public final class LinkedDequeTest extends AbstractTest {
     }
 
     @Override
+    public long getLastUsed() {
+        return 0;
+    }
+
+    @Override
     public boolean equals(Object o) {
       if (!(o instanceof SimpleLinkedValue)) {
         return false;

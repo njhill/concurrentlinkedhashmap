@@ -19,7 +19,7 @@ import static com.googlecode.concurrentlinkedhashmap.ConcurrentLinkedHashMap.Dra
 import static com.googlecode.concurrentlinkedhashmap.ConcurrentLinkedHashMap.DrainStatus.PROCESSING;
 import static com.googlecode.concurrentlinkedhashmap.ConcurrentLinkedHashMap.DrainStatus.REQUIRED;
 import static java.util.Collections.emptyList;
-import static java.util.Collections.unmodifiableMap;
+//import static java.util.Collections.unmodifiableMap;
 import static java.util.Collections.unmodifiableSet;
 
 import java.io.InvalidObjectException;
@@ -342,11 +342,27 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
    * @param node the entry in the page replacement policy
    */
   void afterRead(Node<K, V> node) {
-    final int bufferIndex = readBufferIndex();
-    final long writeCount = recordRead(bufferIndex, node);
-    drainOnReadIfNeeded(bufferIndex, writeCount);
-    notifyListener();
+    afterRead(node, 0L);
   }
+  
+  void afterRead(final Node<K, V> node, final long lastUsed) {
+	    if(lastUsed > 0L) {
+	    	afterWrite(new Runnable() {
+	    	    @Override
+	    	    @GuardedBy("evictionLock")
+	    	    public void run() {
+	    	      // must update lastUsed in locked context
+	    	      node.touch(lastUsed);
+	    	      applyRead(node);
+	    	    }
+	    	}, false);
+	    } else {
+	    	final int bufferIndex = readBufferIndex();
+	    	final long writeCount = recordRead(bufferIndex, node);
+	    	drainOnReadIfNeeded(bufferIndex, writeCount);
+	    	notifyListener();
+	    }
+	  }
 
   /** Returns the index to the read buffer to record into. */
   static int readBufferIndex() {
@@ -399,10 +415,14 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
    * @param task the pending operation to be applied
    */
   void afterWrite(Runnable task) {
+	  afterWrite(task, true);
+  }
+  
+  void afterWrite(Runnable task, boolean notify) {
     writeBuffer.add(task);
     drainStatus.lazySet(REQUIRED);
     tryToDrainBuffers();
-    notifyListener();
+    if(notify) notifyListener();
   }
 
   /**
@@ -450,6 +470,7 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
         break;
       }
 
+      node.touch(0L /*now*/);
       slot.lazySet(null);
       applyRead(node);
       readBufferReadCount[bufferIndex]++;
@@ -465,7 +486,8 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
     // removing it. If the entry is no longer linked then it does not need to
     // be processed.
     if (evictionDeque.contains(node)) {
-      evictionDeque.moveToBack(node);
+//      evictionDeque.moveToBack(node);
+    	evictionDeque.reposition(node);
     }
   }
 
@@ -539,6 +561,10 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
     Node<K, V> node;
     while ((node = pendingNotifications.poll()) != null) {
       listener.onEviction(node.key, node.getValue());
+      if(listener instanceof EvictionListenerWithTime) {
+    	  ((EvictionListenerWithTime<K,V>)listener)
+    	  	.onEviction(node.key, node.getValue(), node.getLastUsed());
+      }
     }
   }
 
@@ -559,7 +585,8 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
 
       // ignore out-of-order write operations
       if (node.get().isAlive()) {
-        evictionDeque.add(node);
+//        evictionDeque.add(node);
+        evictionDeque.insert(node); // time-based
         evict();
       }
     }
@@ -586,17 +613,22 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
   final class UpdateTask implements Runnable {
     final int weightDifference;
     final Node<K, V> node;
+    final long newTime; // -1 for no change (quiet), 0 for "now"
 
-    public UpdateTask(Node<K, V> node, int weightDifference) {
+    public UpdateTask(Node<K, V> node, int weightDifference, long newTime) {
       this.weightDifference = weightDifference;
       this.node = node;
+      this.newTime = newTime;
     }
 
     @Override
     @GuardedBy("evictionLock")
     public void run() {
       weightedSize.lazySet(weightedSize.get() + weightDifference);
-      applyRead(node);
+      if(newTime >= 0 && newTime != node.getLastUsed()) {
+    	  node.touch(newTime);
+    	  applyRead(node);
+      }
       evict();
     }
   }
@@ -676,6 +708,38 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
     afterRead(node);
     return node.getValue();
   }
+  
+  /**
+   * @param lastUsed 0 means "now"
+   */
+//  @Override
+  public V get(Object key, long lastUsed) {
+    final Node<K, V> node = data.get(key);
+    if (node == null) {
+      return null;
+    }
+    afterRead(node, lastUsed);
+    return node.getValue();
+  }
+  
+  /**
+   * NOTE the returned value could be stale
+   * 
+   * @return entry's last-used timestamp or -1 if not found
+   */
+  public long getLastUsedTime(Object key) {
+	  final Node<K, V> node = data.get(key);
+	  long lut = node == null ? -1L : node.getLastUsed();
+	  return lut <= 0L ? -1L : lut;
+  }
+  
+  /**
+   * @return entry's weight or -1 if not found
+   */
+  public int getWeight(Object key) {
+      final Node<K, V> node = data.get(key);
+      return node == null ? -1 : node.get().weight;
+  }
 
   /**
    * Returns the value to which the specified key is mapped, or {@code null}
@@ -695,12 +759,23 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
 
   @Override
   public V put(K key, V value) {
-    return put(key, value, false);
+    return put(key, value, 0L, false);
   }
 
   @Override
   public V putIfAbsent(K key, V value) {
-    return put(key, value, true);
+    return put(key, value, 0L, true);
+  }
+  
+  /**
+   * @param key
+   * @param value
+   * @param lastUsed 0 means "now"
+   * @return
+   */
+//  @Override
+  public V putIfAbsent(K key, V value, long lastUsed) {
+    return put(key, value, lastUsed, true);
   }
 
   /**
@@ -709,17 +784,19 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
    *
    * @param key key with which the specified value is to be associated
    * @param value value to be associated with the specified key
+   * @param lastUsed 0 means "now"
    * @param onlyIfAbsent a write is performed only if the key is not already
    *     associated with a value
    * @return the prior value in the data store or null if no mapping was found
    */
-  V put(K key, V value, boolean onlyIfAbsent) {
+  V put(K key, V value, long lastUsed, boolean onlyIfAbsent) {
     checkNotNull(key);
     checkNotNull(value);
+    if(lastUsed < 0L) throw new IllegalArgumentException("lastUsed must be >= 0");
 
     final int weight = weigher.weightOf(key, value);
     final WeightedValue<V> weightedValue = new WeightedValue<V>(value, weight);
-    final Node<K, V> node = new Node<K, V>(key, weightedValue);
+    final Node<K, V> node = new Node<K, V>(key, weightedValue, lastUsed);
 
     for (;;) {
       final Node<K, V> prior = data.putIfAbsent(node.key, node);
@@ -727,7 +804,7 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
         afterWrite(new AddTask(node, weight));
         return null;
       } else if (onlyIfAbsent) {
-        afterRead(prior);
+        afterRead(prior, lastUsed);
         return prior.getValue();
       }
       for (;;) {
@@ -739,9 +816,9 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
         if (prior.compareAndSet(oldWeightedValue, weightedValue)) {
           final int weightedDifference = weight - oldWeightedValue.weight;
           if (weightedDifference == 0) {
-            afterRead(prior);
+            afterRead(prior, lastUsed);
           } else {
-            afterWrite(new UpdateTask(prior, weightedDifference));
+            afterWrite(new UpdateTask(prior, weightedDifference, lastUsed));
           }
           return oldWeightedValue.value;
         }
@@ -811,7 +888,7 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
         if (weightedDifference == 0) {
           afterRead(node);
         } else {
-          afterWrite(new UpdateTask(node, weightedDifference));
+          afterWrite(new UpdateTask(node, weightedDifference, 0L));
         }
         return oldWeightedValue.value;
       }
@@ -841,7 +918,35 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
         if (weightedDifference == 0) {
           afterRead(node);
         } else {
-          afterWrite(new UpdateTask(node, weightedDifference));
+          afterWrite(new UpdateTask(node, weightedDifference, 0L));
+        }
+        return true;
+      }
+    }
+  }
+  
+//  @Override
+  public boolean replaceQuietly(K key, V oldValue, V newValue) {
+    checkNotNull(key);
+    checkNotNull(oldValue);
+    checkNotNull(newValue);
+
+    final int weight = weigher.weightOf(key, newValue);
+    final WeightedValue<V> newWeightedValue = new WeightedValue<V>(newValue, weight);
+
+    final Node<K, V> node = data.get(key);
+    if (node == null) {
+      return false;
+    }
+    for (;;) {
+      final WeightedValue<V> oldWeightedValue = node.get();
+      if (!oldWeightedValue.isAlive() || !oldWeightedValue.contains(oldValue)) {
+        return false;
+      }
+      if (node.compareAndSet(oldWeightedValue, newWeightedValue)) {
+        final int weightedDifference = weight - oldWeightedValue.weight;
+        if (weightedDifference != 0) {
+          afterWrite(new UpdateTask(node, weightedDifference, -1L));
         }
         return true;
       }
@@ -947,6 +1052,53 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
       evictionLock.unlock();
     }
   }
+  
+  public Map<K, Long> descendingLruMap() {
+	    return orderedLruMap(false, Integer.MAX_VALUE);
+	  }
+  
+  Map<K, Long> orderedLruMap(boolean ascending, int limit) {
+	    checkArgument(limit >= 0);
+	    evictionLock.lock();
+	    try {
+	      drainBuffers();
+
+	      final int initialCapacity = (weigher == Weighers.entrySingleton())
+	          ? Math.min(limit, (int) weightedSize())
+	          : 16;
+	      final Map<K, Long> map = new LinkedHashMap<K, Long>(initialCapacity);
+	      final Iterator<Node<K, V>> iterator = ascending
+	          ? evictionDeque.iterator()
+	          : evictionDeque.descendingIterator();
+	      while (iterator.hasNext() && (limit > map.size())) {
+	        Node<K, V> node = iterator.next();
+	        map.put(node.key, node.getLastUsed());
+	      }
+	      //NOTE the original implementation returned an unmodifiable map here,
+	      // but it's preferable for us to be able to mutate it (understanding that
+	      // the contents are a snapshot)
+//	      return unmodifiableMap(map);
+	      return map;
+	    } finally {
+	      evictionLock.unlock();
+	    }
+	  }
+  
+  public static long EMPTY_OLDEST_TIME = -1L;
+  
+  /**
+   * @return -1 if empty
+   */
+  public long oldestTime() {
+	  evictionLock.lock();
+	  try {
+		  drainBuffers();
+		  final Node<K, V> first = evictionDeque.peekFirst();
+		  return first != null ? first.getLastUsed() : EMPTY_OLDEST_TIME;
+	  } finally {
+		  evictionLock.unlock();
+	  }
+  }
 
   @Override
   public Collection<V> values() {
@@ -995,7 +1147,7 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
    * @throws IllegalArgumentException if the limit is negative
    */
   public Map<K, V> ascendingMapWithLimit(int limit) {
-    return orderedMap(true, limit);
+    return orderedMap(true, limit, Integer.MAX_VALUE);
   }
 
   /**
@@ -1033,10 +1185,17 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
    * @throws IllegalArgumentException if the limit is negative
    */
   public Map<K, V> descendingMapWithLimit(int limit) {
-    return orderedMap(false, limit);
+    return orderedMap(false, limit, 0L);
+  }
+  
+  /**
+   * @param usedSince return only entries used since this time
+   */
+  public Map<K, V> descendingMapWithCutoff(long usedSince) {
+      return orderedMap(false, Integer.MAX_VALUE, usedSince);
   }
 
-  Map<K, V> orderedMap(boolean ascending, int limit) {
+  Map<K, V> orderedMap(boolean ascending, int limit, long usedSinceOrBefore) {
     checkArgument(limit >= 0);
     evictionLock.lock();
     try {
@@ -1051,9 +1210,16 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
           : evictionDeque.descendingIterator();
       while (iterator.hasNext() && (limit > map.size())) {
         Node<K, V> node = iterator.next();
+        long lastUsed = node.lastUsed;
+        if(lastUsed > 0L && (ascending ? lastUsed > usedSinceOrBefore
+                : lastUsed < usedSinceOrBefore)) break;
         map.put(node.key, node.getValue());
       }
-      return unmodifiableMap(map);
+      //NOTE the original implementation returned an unmodifiable map here,
+      // but it's preferable for us to be able to mutate it (understanding that
+      // the contents are a snapshot)
+//      return unmodifiableMap(map);
+      return map;
     } finally {
       evictionLock.unlock();
     }
@@ -1143,11 +1309,25 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
     Node<K, V> prev;
     @GuardedBy("evictionLock")
     Node<K, V> next;
+    
+    // non-volatile, evictionLock used to ensure write visibility
+    long lastUsed;
 
     /** Creates a new, unlinked node. */
-    Node(K key, WeightedValue<V> weightedValue) {
+    Node(K key, WeightedValue<V> weightedValue, long time) {
       super(weightedValue);
       this.key = key;
+      touch(time);
+    }
+    
+    public void touch(long time) {
+    	lastUsed = time == 0L ? System.currentTimeMillis()
+    			: Math.max(lastUsed, time);
+    }
+    
+    @Override
+    public long getLastUsed() {
+    	return lastUsed;
     }
 
     @Override
@@ -1598,4 +1778,17 @@ public final class ConcurrentLinkedHashMap<K, V> extends AbstractMap<K, V>
       return new ConcurrentLinkedHashMap<K, V>(this);
     }
   }
+  
+  public interface EvictionListenerWithTime<K, V> extends EvictionListener<K, V> {
+
+	  /**
+	   * A call-back notification that the entry was evicted.
+	   *
+	   * @param key the entry's key
+	   * @param value the entry's value
+	   * @param lastUsed time the entry was added or last used
+	   */
+	  void onEviction(K key, V value, long lastUsed);
+	}
+
 }

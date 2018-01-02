@@ -228,6 +228,56 @@ final class LinkedDeque<E extends Linked<E>> extends AbstractCollection<E> imple
       linkLast(e);
     }
   }
+  
+  // like moveToBack
+  public void reposition(E e) {
+	  final long lu = e.getLastUsed();
+	  E prev = e.getPrevious();
+	  if(prev == null || prev.getLastUsed() <= lu) {
+		  E next = e.getNext();
+		  if(next == null || next.getLastUsed() >= lu) {
+			  // already in correct position
+			  return;
+		  }
+	  }
+	  unlink(e);
+	  insert(e);
+  }
+  
+  // assumes e.next == e.previous == null
+  public boolean insert(E e) {
+	  if(contains(e)) return false;
+	  E l = last;
+	  if(l == null) {
+		  last = first = e;
+		  return true;
+	  }
+	  long ts = e.getLastUsed();
+	  for(;;) {
+		  if(l.getLastUsed() <= ts) { // so l <= e < l.getNext()
+			  E ln = l.getNext();
+			  if(ln == null) { // here last must be l
+				  last = e;
+			  } else {
+				  ln.setPrevious(e);
+				  e.setNext(ln);
+			  }
+			  e.setPrevious(l);
+			  l.setNext(e);
+			  return true;
+		  }
+		  E lp = l.getPrevious();
+		  if(lp == null) { // here first must be l
+			  e.setNext(l);
+			  l.setPrevious(e);
+			  first = e;
+			  return true;
+		  }
+		  l = lp;
+	  }
+  }
+  
+  
 
   @Override
   public E peek() {
@@ -460,4 +510,6 @@ interface Linked<T extends Linked<T>> {
 
   /** Sets the next element or <tt>null</tt> if there is no link. */
   void setNext(T next);
+  
+  long getLastUsed();
 }
